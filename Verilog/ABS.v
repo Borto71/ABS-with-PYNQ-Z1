@@ -1,109 +1,143 @@
 `timescale 1ns / 1ps
 
 module EFSM_ABS_System(
-    input clk, // clock del sistema
-    input reset, // reset del sistema
-    input [7:0] wheel_speed, // velocità di una ruote
-    input [7:0] vehicle_speed, // velocità del veicolo
-    input [1:0] direction, // direzione del veicolo (0 = dritto, 1 = sinistra, 2 = destra)
-    input direction, // direzione del veicolo (0 = dritto, 1 = sinistra, 2 = destra)
-    input brake_signal, // segnale del pedale del freno
-    input accelerometer, // accelerometro
-    input engine_status, // stato del motore
-    output reg Vrc1, // output elettrovavola, 1 bit perchè ha due stati (aperto o chiuso)
-    output reg Vrc2, // output elettrovavola 2, 1 bit perchè ha due stati (aperto o chiuso)
-    output reg recovery_pump // pompa di recupero, 1 bit perchè ha due stati (attiva o non attiva)
+    input  wire       clk,
+    input  wire       reset,
+    input  wire [7:0] wheel_speed,
+    input  wire [7:0] vehicle_speed,
+    input  wire [1:0] direction,     // 00=dritto, 01=sinistra, 10=destra
+    input  wire       brake_signal,
+    input  wire       accelerometer,  // 1 = forte decelerazione
+    input  wire       engine_status,
+    output reg        Vrc1,
+    output reg        Vrc2,
+    output reg        recovery_pump
 );
 
+    // FSM states
+    localparam NORMAL_OPERATION   = 2'b00;
+    localparam ANTILOCKING        = 2'b01;
+    localparam RELEASE_PRESSURE   = 2'b10;
+    localparam REAPPLY_PRESSURE   = 2'b11;
 
-    parameter // Stati della macchina a stati
-    NORMAL_OPERATION = 2'b00, // Funzionamento normale
-    ANTILOCKING = 2'b01, // Stato di blocco delle ruote
-    RELEASE_PRESSURE = 2'b10, // Rilascio della pressione frenante
-    REAPPLY_PRESSURE = 2'b11;  // Riadattamento della pressione frenante
+    // Slip thresholds (percentuale, intero 0..100)
+    localparam SLIP_ENTER = 20; // entri in ANTILOCKING se slip > 20%
+    localparam SLIP_EXIT  = 10; // esci da ANTILOCKING se slip < 10%
 
-    reg[2:0] current_state, next_state; // Stato corrente e successivo
+    // Durata minima in ANTILOCKING
+    localparam MIN_ANTILOCKING_TIME = 3;
 
-    reg cont = 1'b0;  // contatore per contare quante volte interviene l'ABS
-    reg valore_empirico = 16'd26; // valore empirico per quando si sterza a destra o sinistra, 0,1 rappresentato in Q8.8
+    reg [1:0]  current_state, next_state;
+    reg [2:0]  antislip_counter;   // conta cicli in ANTILOCKING
+    reg [7:0]  slip_pct;           // slip percentuale
 
-    // Parametri di soglia (REGOLABILI)
-    parameter SPEED_THRESHOLD = 8'd10;  // Differenza di velocità accettabile
-
-    // Stato successivo e logica della macchina a stati
-    always @(posedge clk or posedge reset) begin
-        if (reset)
-            current_state <= NORMAL_OPERATION;
-        else
-            current_state <= next_state;
+    // Calcolo percentuale di slittamento (0 se wheel_speed >= vehicle_speed o vs==0)
+    always @(*) begin
+        if (vehicle_speed != 0 && wheel_speed < vehicle_speed) begin
+            slip_pct = ((vehicle_speed - wheel_speed) * 100) / vehicle_speed;
+        end else begin
+            slip_pct = 0;
+        end
     end
 
-    // Logica combinatoria per le transizioni degli stati
-    always @(*) begin // il blocco always @(*) viene eseguito ogni volta che uno dei segnali di input cambia
+    // ----------------------------
+    // 1) Registro di stato + contatore
+    // ----------------------------
+    always @(posedge clk or posedge reset) begin
+        if (reset) begin
+            current_state    <= NORMAL_OPERATION;
+            antislip_counter <= 0;
+        end else begin
+            // Avanzamento stato
+            current_state <= next_state;
+
+            // Conta i cicli in ANTILOCKING
+            if (current_state == ANTILOCKING)
+                antislip_counter <= antislip_counter + 1;
+            else
+                antislip_counter <= 0;
+        end
+    end
+
+    // ----------------------------
+    // 2) Logica combinatoria per transizioni
+    // ----------------------------
+    always @(*) begin
+        // default next_state
         next_state = current_state;
+
         case (current_state)
             NORMAL_OPERATION: begin
-                if (vehicle_speed > 3'b101 && engine_status == 1'b1 && brake_signal == 1'b1 && ((vehicle_speed - wheel_speed) / vehicle_speed) < SPEED_THRESHOLD) begin
-                    next_state = ANTILOCKING; // se il motore e' acceso e il pedale del freno e' premuto e la differenza di velocita' e' minore della soglia, allora passo allo stato di antilocking
-                end
-                else begin 
-                    next_state = NORMAL_OPERATION; // rimango nello stato di normal operation
+                if (engine_status
+                    && brake_signal
+                    && vehicle_speed > 8'd5
+                    && slip_pct > SLIP_ENTER
+                ) begin
+                    next_state = ANTILOCKING;
                 end
             end
-            
+
             ANTILOCKING: begin
-                if(vehicle_speed > 3'b101 && (vehicle_speed - wheel_speed) / vehicle_speed > SPEED_THRESHOLD || accelerometer > 1 || cont > 7) begin // controllo se la strada e' possibilmente bagnata, controllo che lo slip sia maggiore del 25%
-                    Vrc1 = 1'b0; // chiudo la valvola 1
-                    next_state = RELEASE_PRESSURE; // passo allo stato di rilascio della pressione frenante
-                end else begin
-                    next_state = NORMAL_OPERATION; // rimango nello stato di normal operation
+                // rimango almeno MIN_ANTILOCKING_TIME cicli e poi esco se slip basso
+                if ((antislip_counter >= MIN_ANTILOCKING_TIME) 
+                    && (slip_pct < SLIP_EXIT)
+                ) begin
+                    next_state = RELEASE_PRESSURE;
                 end
             end
 
             RELEASE_PRESSURE: begin
-                if(direction == 2'b10) begin // sto sterzando a destra
-                    if (vehicle_speed > 3'b101 && (vehicle_speed - wheel_speed) / vehicle_speed > SPEED_THRESHOLD || accelerometer > 1 || cont > 7) begin
-                        Vrc2 = 1'b1; // apro la valvola 2, scarico la pressione
-                        if ((vehicle_speed - wheel_speed) / vehicle_speed > SPEED_THRESHOLD) begin
-                            recovery_pump = 1'b1; // attivo la pompa di recupero
-                            next_state = ANTILOCKING; // sto ancora bloccando le ruote
-                        end
-                    end
-                end
-                if(direction == 2'b01) begin // sto sterzando a sinistra
-                    if (vehicle_speed > 3'b101 && ((vehicle_speed - wheel_speed) / vehicle_speed) + valore_empirico > SPEED_THRESHOLD || accelerometer > 1 || cont > 7) begin
-                        Vrc2 = 1'b1; // apro la valvola 2, scarico la pressione
-                        if ((vehicle_speed - wheel_speed) / vehicle_speed > SPEED_THRESHOLD) begin
-                            recovery_pump = 1'b1; // attivo la pompa di recupero
-                            next_state = ANTILOCKING; // sto ancora bloccando le ruote
-
-                        end
-                    end
-                end
-                if(direction == 2'b00) begin // sto andando dritto
-                    if (vehicle_speed > 3'b101 && (vehicle_speed - wheel_speed) / vehicle_speed > SPEED_THRESHOLD || accelerometer > 1 || cont > 7) begin
-                        Vrc2 = 1'b1; // apro la valvola 2, scarico la pressione
-                        if ((vehicle_speed - wheel_speed) / vehicle_speed > SPEED_THRESHOLD) begin
-                            recovery_pump = 1'b1; // attivo la pompa di recupero
-                            next_state = ANTILOCKING; // sto ancora bloccando le ruote
-                        end
-                    end
-                end
-                else begin // non sto piu bloccando
-                    next_state = REAPPLY_PRESSURE; // riappllico la pressione frenante
+                // in RELEASE_PRESSURE scarico valvola 2
+                // se ancora slip alto, torno in ANTILOCKING, altrimenti vado a REAPPLY
+                if ( (slip_pct > SLIP_ENTER) 
+                     || accelerometer
+                     || (antislip_counter > 7)
+                   ) begin
+                    next_state = ANTILOCKING;
+                end else begin
+                    next_state = REAPPLY_PRESSURE;
                 end
             end
 
-             REAPPLY_PRESSURE: begin
-                if ((vehicle_speed - wheel_speed) / vehicle_speed > SPEED_THRESHOLD || accelerometer > 1 || cont > 7) begin
+            REAPPLY_PRESSURE: begin
+                // riapplico pressione finché slip basso
+                if (slip_pct < SLIP_EXIT && !brake_signal) begin
+                    next_state = NORMAL_OPERATION;
+                end else if (slip_pct > SLIP_ENTER) begin
                     next_state = ANTILOCKING;
-                    cont = cont + 1; // incremento il contatore, ho completato un ciclo di ABS
-                end else begin
-                    Vrc2 = 1'b0; // chiudo la valvola 2, riapplico la pressione
-                    recovery_pump = 1'b0; // disattivo la pompa di recupero
-                    Vrc1 = 1'b1; // riapro la valvola 1, riapplico la pressione
-                    next_state = NORMAL_OPERATION; // rimango nello stato di normal operation, non sto piu bloccando le ruote
                 end
+            end
+        endcase
+    end
+
+    // ----------------------------
+    // 3) Uscite in base allo stato
+    // ----------------------------
+    always @(*) begin
+        // default outputs
+        Vrc1         = 1'b1;
+        Vrc2         = 1'b0;
+        recovery_pump= 1'b0;
+
+        case (current_state)
+            NORMAL_OPERATION: begin
+                // tutto normale
+            end
+
+            ANTILOCKING: begin
+                Vrc1 = 1'b0;        // chiudo valvola 1
+                Vrc2 = 1'b1;        // apro valvola 2
+                recovery_pump = 1'b1;
+            end
+
+            RELEASE_PRESSURE: begin
+                Vrc2 = 1'b1;        // mantengo scarico pressione
+            end
+
+            REAPPLY_PRESSURE: begin
+                Vrc1 = 1'b1;        // riapplico pressione
+                Vrc2 = 1'b0;
+                recovery_pump = 1'b0;
             end
         endcase
     end
