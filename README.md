@@ -47,5 +47,7 @@ varied dynamic scenarios.
 ## **REFERENCE**
 
 [1] TEXA EDU, Introduzione ai sistemi ABS, Dispense didattiche, 2024.
+
 [2] Corso FPGA – Universit`a di Verona, Prof. Luigi Capogrosso, Anno accademico 2024/2025.
+
 [3] Gianluca Bortolaso, Supporto e chiarimenti sul funzionamento dell’ABS, discussioni personali, 2025.
